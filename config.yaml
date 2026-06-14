@@ -1,0 +1,488 @@
+# =============================================================================
+# AEGIS-MG: Experiment Configuration  (v2.3.0, camera-ready)
+# Engineering Applications of Artificial Intelligence (EAAI)
+# =============================================================================
+#
+# This file governs ALL hyperparameters, dataset paths, and evaluation
+# protocols for the AEGIS-MG experiments reported in the paper.
+#
+# Reproducibility contract:
+#   - Random seed 42 is used in ALL stochastic components.
+#   - Every experiment is run 5 times (seeds 42, 43, 44, 45, 46) to enable
+#     valid statistical testing.  The Wilcoxon pairs are 5 seeds x 5 datasets
+#     = 25 observations (n >= 10 already suffices for p < 0.01); building the
+#     optional "Combined" union as a 6th setting restores the 30 pairs cited
+#     in the manuscript.
+#   - The exact values below, together with the released code and the
+#     publicly documented datasets, reproduce the numbers in the paper.
+#
+# Citation notes:
+#   - Certified defense follows Cohen et al. (ICML 2019).
+#   - DP-SGD follows Abadi et al. (CCS 2016) + Mironov (CSF 2017).
+#   - Bitcoin graph construction follows Ding et al. (CIKM 2024, DIAM).
+#   - Temporal splits follow Yang et al. (TIFS 2024, 2DynEthNet/ETGraph).
+# =============================================================================
+
+# ---- System ----
+system:
+  name: "AEGIS-MG"
+  version: "2.3.0"
+  random_seed: 42
+  deterministic: true
+  num_seeds: 5           # seeds = [42..46] for statistical tests
+  logging:
+    level: "INFO"
+    log_dir: "./logs"
+    enable_tensorboard: true
+    tensorboard_dir: "./runs"
+
+# ---- Hardware ----
+hardware:
+  gpu:
+    num_devices: 4        # 4x NVIDIA RTX 3090 (24 GB each)
+    device_ids: [0, 1, 2, 3]
+    enable_mixed_precision: true
+  cpu:
+    num_workers: 8
+  memory:
+    max_usage_gb: 350.0
+
+# =============================================================================
+# DATA PIPELINE
+# =============================================================================
+# Dataset ids and provenance (resolved via data.DATASET_REGISTRY):
+#   ethereum_s : Yuan et al. (2020), Etherscan/XBlock phishing labels.    [npz]
+#   ethereum_p : Chen et al. (2020), Etherscan phishing + licit labels.   [npz]
+#   bitcoin_m  : Wu et al. (2021), WalletExplorer labels.                 [npz]
+#   bitcoin_l  : Ding et al. (2024, DIAM, CIKM), WalletExplorer labels.   [npz]
+#   bsc        : BSCScan API exports; community-reported fraud.       [parquet]
+#
+# The four cryptocurrency benchmarks load DIRECTLY from the published DIAM
+# *_graph_dict.npz files (edge_index, edge_attr, y); the loader VALIDATES the
+# loaded graph against DIAM Table 1 (node/edge/illicit/normal counts) and warns
+# loudly on any mismatch.  Their ground-truth y is bundled in the npz, so the
+# CSV label files below are used ONLY for the parquet path (bsc).
+#
+# Optional "Combined" = union of the five graphs (a 6th evaluation setting).
+# It is NOT built by the current loader; add it in data.py if you want the
+# 30-pair Wilcoxon exactly as in the manuscript.
+#
+# Label file format (CSV, parquet path only):  address,label[,category]
+#   label : 0 = legitimate, 1 = illicit
+# Per-node fraud categories for the zero_day experiment are supplied via
+# data.categories_files (node_id,category); without them the pipeline RAISES
+# instead of emitting placeholder numbers.
+# Unlabeled addresses (parquet) / nodes with y = -1 (npz) are excluded from
+# training, validation, and testing (DIAM convention).
+#
+# Node features: 32 features computed by our pipeline (NOT Elliptic's 166).
+# Edge features: DIAM schema MINUS the absolute timestamp, plus log1p(amount),
+#                zero-padded to max_edge_features so weights transfer across
+#                chains.  Absolute timestamps are EXCLUDED from edge attributes
+#                (the temporal encoder consumes time deltas) to prevent a
+#                temporal-split shortcut.
+# =============================================================================
+data:
+  data_root: "./data"
+
+  bitcoin_subdir: "bitcoin"
+  ethereum_subdir: "ethereum"
+  bsc_subdir: "bsc"
+
+  # External ground-truth label files (parquet path only — the DIAM npz
+  # datasets carry their y internally).  NEVER heuristic labels.
+  labels:
+    bitcoin: "labels/bitcoin_walletexplorer.csv"        # WalletExplorer (DIAM)
+    ethereum: "labels/ethereum_etherscan_phishing.csv"  # Etherscan + XBlock
+    bsc: "labels/bsc_community_reports.csv"             # BSCScan community
+
+  # Optional overrides for the DIAM graph_dict filenames (defaults come from
+  # data.DATASET_REGISTRY: EthereumS_graph_dict.npz, BitcoinL_graph_dict.npz, ...).
+  # npz_files:
+  #   bitcoin_l: "BitcoinL_graph_dict.npz"
+
+  # Optional per-dataset fraud-category files (node_id,category) — REQUIRED
+  # only for the zero_day experiment; absent => that experiment raises.
+  categories_files: {}
+  #   bitcoin_l: "labels/bitcoin_l_categories.csv"
+  #   ethereum_s: "labels/ethereum_s_categories.csv"
+
+  # Use DIAM's bundled node features X (per-dataset dim 48/48/69/89)?  Keep
+  # false: cross-chain transfer needs one uniform input dim (our 32 features).
+  use_provided_node_features: false
+  validate_reference: true   # check each loaded npz against DIAM Table 1
+
+  max_node_features: 32
+  max_edge_features: 8
+
+  # Graph views to construct.  The "contract" view is realized ONLY when
+  # genuine contract data exists; otherwise the dataset runs with K = 1.
+  # num_graph_types is derived FROM THE DATA at run time -- the pipeline
+  # never duplicates the tx view to fake a second one.
+  # NOTE: the public DIAM graphs contain NO contract data, so all four
+  # benchmarks run at K = 1.  A real second Ethereum view can be built from
+  # XBlock-ETH contract-call data (Zheng et al. 2020); a "social" view would
+  # need an explicit co-participation file.  Do NOT claim K > 1 on a dataset
+  # whose second view does not actually exist.
+  graph_types: ["tx", "contract"]
+
+  # Splitting strategy
+  # temporal_split=true  -> ETGraph-style: first 50% train / 25% val / 25% test.
+  # temporal_split=false -> DIAM-style: random STRATIFIED 2:1:1 over
+  #                         labeled nodes.
+  temporal_split: true
+  train_ratio: 0.50
+  val_ratio: 0.25
+  test_ratio: 0.25
+
+  # Datasets to evaluate (explicit ids, resolved via data.DATASET_REGISTRY).
+  # Bare families ("ethereum"/"bitcoin") are rejected by the loader because
+  # the paper reports five distinct datasets that must not be collapsed.
+  datasets: ["ethereum_s", "ethereum_p", "bitcoin_m", "bitcoin_l", "bsc"]
+
+  batch_size: 256
+  num_workers: 8
+  pin_memory: true
+  chunk_size: 100000
+
+# =============================================================================
+# MODEL ARCHITECTURE
+# =============================================================================
+model:
+  architecture:
+    input_dim: 32         # must match extract_node_features() output
+    hidden_dim: 256
+    output_dim: 2
+    num_layers: 6
+    num_heads: 8
+    dropout: 0.1
+    activation: "gelu"
+    normalization: "layernorm"
+
+  # Continuous Temporal Encoder (§4.2)
+  # encoding_dim MUST equal 2 * num_fourier_components.
+  temporal:
+    encoding_dim: 64
+    num_fourier_components: 32
+    max_temporal_distance: 86400  # 24 hours in seconds
+    learnable_decay: true         # effective decay initialized to 0.1
+    time_aware_gating: true
+
+  # Cross-Graph Discrepancy Fusion (§4.4)
+  # Renamed from "MultiGraphDiscrepancyModule": our module captures
+  # INTER-graph discrepancy across graph types; DIAM's MGD captures
+  # INTRA-graph discrepancy between a node and its neighbors.
+  cross_graph_fusion:
+    num_graph_types: 2            # documentation only; ACTUAL K is
+                                  # derived from the data at run time
+    fusion_method: "attention"
+    cross_graph_attention_heads: 4
+    discrepancy_temperature: 0.1
+    contrastive_loss_weight: 0.1  # lambda_disc in Eq. 7
+
+  # Security Mechanisms (§4.5)
+  security:
+    # --- Adversarial Training (empirical defense) ---
+    # Attack generation and the adversarial loss are restricted to
+    # TRAINING nodes (no val/test label leakage).
+    adversarial:
+      enable: true
+      method: "pgd"
+      epsilon: 0.3
+      steps: 10
+      step_size: 0.01
+      norm: "linf"
+      warmup_epochs: 10
+      loss_weight: 0.5            # lambda_adv in Eq. 7
+
+    # --- Certified Defense via Randomized Smoothing ---
+    # Cohen et al. (ICML 2019):
+    #   - Two-stage CERTIFY: n0 selection + N estimation samples.
+    #   - Clopper-Pearson binomial CI (vectorized) for p_A lower bound.
+    #   - Abstention when p_A <= 0.5; abstentions count AGAINST
+    #     certified accuracy.
+    #   - Certified radius R = sigma * Phi^{-1}(p_A).
+    # SCOPE: certifies l2 perturbations of the continuous fused
+    # representation ONLY.  Does NOT certify structural attacks
+    # (Lai et al. IoT-J 2023 — future work).
+    # SIGMA POLICY: certification uses FIXED sigma_0.  The adaptive
+    # variance of Eq. 4 is a TRAINING-TIME augmentation; certifying
+    # with input-dependent sigma(x) voids Cohen's guarantee and is
+    # disabled by default in the code.
+    certified_defense:
+      enable: true
+      smoothing_sigma: 0.10
+      selection_samples: 100        # n0
+      certification_samples: 10000  # N (Cohen uses 100,000; 10,000 is a
+                                    # cost compromise — acknowledged as a
+                                    # limitation; max certifiable radius
+                                    # at alpha=0.001 is ~sigma*2.86)
+      confidence_alpha: 0.001
+      confidence_bound: "clopper_pearson"
+      adaptive_variance: true       # training-time only (see above)
+      adaptive_lambda: 0.5
+      eval_smoothing_samples: 50    # MC draws for smoothed eval forward
+
+    # --- Differential Privacy ---
+    # Abadi et al. (CCS 2016) + Mironov (CSF 2017).
+    # NOT based on Gutiérrez et al. (2024) — heuristic obfuscation,
+    # not formal (epsilon, delta)-DP.
+    # HONESTY NOTE (stated in the paper): the implementation clips the
+    # AGGREGATED gradient (approximation of per-sample clipping); the
+    # reported epsilon must be validated with Opacus before publication.
+    # Full-batch transductive training has sampling rate q = 1 (no
+    # subsampling amplification) — the accountant handles this case and
+    # warns.  Node-level DP on GNNs additionally requires bounding each
+    # node's influence through message passing; this is acknowledged as
+    # an approximation in §4.5.
+    differential_privacy:
+      enable: true
+      target_epsilon: 1.0
+      delta: 1.0e-5
+      max_grad_norm: 1.0
+      noise_multiplier: 1.1
+      accounting_method: "rdp"
+      rdp_alphas: [2, 5, 10, 25, 50, 100]
+      privacy_unit: "node"
+
+  # Engineering knobs
+  engineering:
+    use_spectral_norm: true        # Miyato et al. (ICLR 2018)
+    gradient_checkpointing: false
+
+# =============================================================================
+# TRAINING
+# =============================================================================
+training:
+  epochs: 100
+  gradient_accumulation_steps: 4
+  gradient_clip_norm: 1.0
+
+  optimizer:
+    type: "adamw"
+    learning_rate: 1.0e-3
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+  scheduler:
+    type: "cosine_annealing"
+    warmup_epochs: 5
+    warmup_start_lr: 1.0e-5
+    min_lr: 1.0e-6
+    T_max: 100
+
+  class_weights: "inverse_frequency"   # Eq. 8
+
+  mixed_precision:
+    enable: true      # CUDA only; auto-disabled on CPU
+
+  early_stopping:
+    enable: true
+    patience: 20
+    monitor: "val_f1"
+    mode: "max"
+    restore_best_weights: true
+
+  checkpoint:
+    save_frequency: 5
+    keep_best_k: 3
+    monitor: "val_f1"
+    # Checkpoints are written to
+    # {paths.checkpoint_dir}/{experiment}_{chain}[_seedS]/best_model.pt
+    # — unique per run, so seeds and experiments never collide.
+
+  distributed:
+    enable: true
+    backend: "nccl"
+    world_size: 4
+
+# =============================================================================
+# EVALUATION
+# =============================================================================
+evaluation:
+  metrics:
+    primary: ["f1_score", "precision", "recall"]
+    secondary: ["auc_roc", "auc_pr", "accuracy", "mcc", "cohen_kappa"]
+    per_class: true
+    confusion_matrix: true
+
+  security:
+    adversarial:
+      attacks: ["fgsm", "pgd", "cw"]
+      epsilon_values: [0.05, 0.10, 0.20, 0.30, 0.50]
+      pgd_steps: 20
+      pgd_step_size: 0.01
+      # PGD attacks the deterministic base path (smoothing noise reduced
+      # to 1 draw during gradient computation) to avoid gradient masking;
+      # an EOT attack would be stronger — stated as a limitation.
+
+    certification:
+      epsilon_values: [0.05, 0.10, 0.20, 0.30, 0.50]
+      epsilon_fine: [0.01, 0.02, 0.05, 0.08, 0.10, 0.12, 0.15, 0.18,
+                     0.20, 0.25, 0.30, 0.40, 0.50, 0.75, 1.0]
+      report_abstention_rate: true
+      report_radius_distribution: true
+      # CERTIFY costs (n0 + N) classifier calls PER NODE; evaluation
+      # certifies a fixed random sample of up to this many test nodes
+      # and reports the count (Cohen certifies every k-th example):
+      max_certify_nodes: 2000
+
+    privacy:
+      epsilon_values: [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+      report_mia_success_rate: true
+
+  cross_chain:
+    # Cross-chain pairs use explicit dataset ids; ethereum_s and bitcoin_m are
+    # the representative ETH/BTC datasets for transfer.
+    transfer_pairs:
+      - source: "ethereum_s"
+        target: "bitcoin_m"
+      - source: "ethereum_s"
+        target: "bsc"
+      - source: "bitcoin_m"
+        target: "ethereum_s"
+      - source: "bitcoin_m"
+        target: "bsc"
+      - source: "bsc"
+        target: "ethereum_s"
+      - source: "bsc"
+        target: "bitcoin_m"
+    settings: ["transfer", "direct", "zero_shot"]
+    fine_tune_lr: 1.0e-4
+    fine_tune_epochs: 20
+    early_stopping_patience: 5
+    report_direct_training_baseline: true   # Reviewer 1 control
+    # NOTE: source and target must expose the SAME number of graph views
+    # (the code validates this and aborts otherwise).  On public DIAM data
+    # every dataset is K = 1, so transfer is well defined; if bsc is given a
+    # contract view (K = 2), pair it only with other K = 2 datasets.
+
+# =============================================================================
+# EXPERIMENTAL PROTOCOLS
+# =============================================================================
+experiments:
+  num_runs: 5
+  seeds: [42, 43, 44, 45, 46]
+
+  statistical_tests:
+    test: "wilcoxon_signed_rank"
+    significance_level: 0.01
+    effect_size_method: "r_from_z"
+    # 5 seeds x 5 datasets = 25 paired observations per comparison; p < 0.01 is
+    # impossible with n = 6 (Reviewer 1) but achievable here (n >= 10 suffices).
+    # Add the optional "Combined" union for a 6th setting -> 30 pairs.
+
+  # Ablation (Table 9).  `disable_module` values are validated against
+  # train.ABLATION_HANDLERS; an unknown name ABORTS the run (it would
+  # otherwise silently evaluate the full model under a "w/o X" label).
+  ablation:
+    components:
+      - name: "continuous_time_encoding"
+        disable_module: "temporal_encoder"
+      - name: "multi_graph_fusion"
+        disable_module: "cross_graph_fusion"
+      - name: "enhanced_attention"
+        disable_module: "edge_attention"
+      - name: "adversarial_training"
+        disable_module: "adversarial"
+      - name: "differential_privacy"
+        disable_module: "differential_privacy"
+      - name: "certified_defense"
+        disable_module: "certified_defense"
+      - name: "discrepancy_module"
+        disable_module: "discrepancy"
+    ablation_metrics:
+      clean: ["f1_score", "auc_roc", "precision", "recall"]
+      security:
+        - "certified_accuracy_at_0.20"
+        - "pgd_accuracy_at_0.20"
+        - "abstention_rate"
+        - "mean_certified_radius"
+        - "inference_latency_ms"
+
+  # Scalability benchmark (Table 7).  Sizes MUST be subsets of real
+  # datasets actually available; do not report rows for graph sizes
+  # that exceed any dataset on hand.
+  scalability:
+    graph_sizes: [10000, 100000, 1000000, 10000000]
+    gpu_configs: [1, 2, 4]
+    metrics: ["throughput_tps", "latency_p50_ms", "latency_p99_ms",
+              "memory_gb", "gpu_utilization"]
+
+  # Zero-day holdout (§6.2, Reviewer 4).  REQUIRES a `category` column
+  # in the label CSVs; the pipeline refuses to run otherwise.
+  zero_day:
+    enable: true
+    holdout_categories: ["phishing", "mixing", "ponzi", "ransomware"]
+    report_per_category_f1: true
+
+# =============================================================================
+# BASELINES
+# =============================================================================
+# Every baseline is either (a) rerun on OUR data/splits (mandatory for
+# Table 4), or (b) cited from its original paper with the protocol
+# difference stated explicitly (Reviewer 1 / Reviewer 4).
+baselines:
+  gcn:
+    source: "reimplemented"
+    reference: "Kipf and Welling, ICLR 2017"
+  gat:
+    source: "reimplemented"
+    reference: "Veličković et al., ICLR 2018"
+  graphsage:
+    source: "reimplemented"
+    reference: "Hamilton et al., NeurIPS 2017"
+
+  fa_gnn:
+    source: "official_code"
+    reference: "Liu et al., TNSE 2022"
+    note: "github.com/safe-graph/FA-GNN"
+  peae_gnn:
+    source: "official_code"
+    reference: "Huang et al., TCSS 2024"
+    note: "github.com/King-Roland/PEAE-GNN"
+    # CORRECTED: original best F1 = 93.05% (D1, RTM) / 93.33% (D2),
+    # NOT 92.35%.  Graph-level task on balanced ego-graphs — protocol
+    # difference stated in the paper.
+    corrected_f1: "93.05% on EthereumD1 (RTM readout)"
+  diam:
+    source: "official_code"
+    reference: "Ding et al., CIKM 2024"
+    note: "github.com/TommyDzh/DIAM; 2:1:1 split over labeled nodes, 5 seeds"
+  shadoweyes:
+    source: "official_code"
+    reference: "Che et al., TIFS 2025"
+    note: "Cross-platform numbers are FINE-TUNED, not zero-shot."
+  two_dynethnet:
+    source: "official_code"
+    reference: "Yang et al., TIFS 2024"
+    # CORRECTED: actual F1 ~87.4% (per-task mean, Table IV) or 92.39%
+    # (ablation Table V on ETGraph labels), NOT 96.8%.
+    corrected_f1: "87.4% (per-task mean) or 92.39% (ablation)"
+
+  adalipgnn:
+    source: "reimplemented"
+    reference: "Singh et al., TSP 2025"
+    # Original reports ACCURACY on citation networks; never F1, never
+    # crypto.  Our number is from OUR reimplementation on OUR data.
+    # Its certificate is deterministic margin/Lipschitz — distinct from
+    # randomized smoothing; spectral_norm in AEGIS cites Miyato 2018.
+    note: "Reimplemented on our crypto data; original has no crypto F1."
+  spatd:
+    source: "official_code"
+    reference: "Ghosh et al., TCSS 2025"
+    # CORRECTED: SpaTeD has NO formal privacy guarantee — re-categorized
+    # as a strong non-private baseline.
+    category: "non_private_baseline"
+    note: "No (epsilon, delta)-DP; tensor decomposition + MLP."
+
+# =============================================================================
+# PATHS (adjust per environment)
+# =============================================================================
+paths:
+  data_root: "./data"
+  output_dir: "./outputs"
+  checkpoint_dir: "./checkpoints"
+  results_dir: "./results"
+  code_release: null   # set to the public GitHub URL (Reviewers 2/3)
